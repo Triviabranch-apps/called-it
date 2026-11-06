@@ -818,7 +818,7 @@ export class MatchRoom {
     if (!this.room?.fixture?.id || !this.env?.FIXTURE_INDEX || (!force && Date.now() - (this.adminSyncAt || 0) < 10000)) return;
     this.adminSyncAt = Date.now();
     const rounds = [...(this.room.session?.rounds || []), this.room.session?.round].filter(Boolean).map(round => ({ id: round.id, type: round.targetType, question: round.question, status: round.status, result: round.result || null, openedAt: round.openedAt || null, presentedMatchTime: round.presentedMatchTime || null, voteEndsAt: round.voteEndsAt || null }));
-    const summary = { roomId: this.state.id.toString(), updatedAt: this.adminSyncAt, fixture: this.room.fixture, session: { status: this.room.session?.status, clock: this.room.session?.clock || 0, clockDisplay: this.room.session?.clockDisplay || null, nextQuestionAt: this.room.session?.nextQuestionAt || null }, playerCount: this.room.players?.length || 0, players: (this.room.players || []).map(player => ({ name: player.name, points: player.points || 0, calls: player.calls || player.rounds || 0, correct: player.correct || 0 })), calls: rounds, provider: { lastLivePollAt: this.room.lastLivePollAt || 0, lastErrorAt: this.room.provider?.lastErrorAt || 0, error: this.room.provider?.error || null, errorCount: this.room.provider?.errorCount || 0, pollIntervalSeconds: this.room.provider?.pollIntervalSeconds || 15, playsProcessed: this.room.provider?.playsProcessed || 0, playsSource: this.room.provider?.playsSource || null, summaryAvailable: this.room.provider?.summaryAvailable ?? null, coreAvailable: this.room.provider?.coreAvailable ?? null, summaryError: this.room.provider?.summaryError || null, coreError: this.room.provider?.coreError || null } };
+    const summary = { roomId: this.state.id.toString(), updatedAt: this.adminSyncAt, fixture: this.room.fixture, session: { status: this.room.session?.status, clock: this.room.session?.clock || 0, clockDisplay: this.room.session?.clockDisplay || null, nextQuestionAt: this.room.session?.nextQuestionAt || null }, playerCount: this.room.players?.length || 0, players: (this.room.players || []).map(player => ({ name: player.name, points: player.points || 0, calls: player.calls || player.rounds || 0, correct: player.correct || 0 })), calls: rounds, provider: { lastLivePollAt: this.room.lastLivePollAt || 0, lastErrorAt: this.room.provider?.lastErrorAt || 0, error: this.room.provider?.error || null, errorCount: this.room.provider?.errorCount || 0, pollIntervalSeconds: this.room.provider?.pollIntervalSeconds || 15, playsProcessed: this.room.provider?.playsProcessed || 0, playsSource: this.room.provider?.playsSource || null, rawCorePlays: this.room.provider?.rawCorePlays || 0, rawSummaryPlays: this.room.provider?.rawSummaryPlays || 0, rawCommentary: this.room.provider?.rawCommentary || 0, timelineEvents: this.room.provider?.timelineEvents || 0, summaryAvailable: this.room.provider?.summaryAvailable ?? null, coreAvailable: this.room.provider?.coreAvailable ?? null, summaryError: this.room.provider?.summaryError || null, coreError: this.room.provider?.coreError || null } };
     try { const id = this.env.FIXTURE_INDEX.idFromName("supported-fixtures"); await this.env.FIXTURE_INDEX.get(id).fetch("https://fixture-index/register-room", { method: "POST", body: JSON.stringify(summary), headers: { "content-type": "application/json" } }); } catch {}
   }
   async archiveCompletedFixture() {
@@ -992,8 +992,16 @@ export class MatchRoom {
         }
         return event;
       };
-      const summaryItems = [...(data.plays || []), ...(data.scoringPlays || []), ...(data.keyEvents || [])];
-      const incoming = [...coreItems.map((item, index) => normaliseEvent(item, index, source)), ...summaryItems.map((item, index) => normaliseEvent(item, index, "summary-live"))]
+      // ESPN's football match commentary is frequently published in the
+      // commentary collection rather than the summary's plays collection.
+      // Omitting it leaves the feed stuck at KICKOFF while the clock moves.
+      const summaryItems = [...(data.plays || []), ...(data.scoringPlays || []), ...(data.keyEvents || []), ...(data.header?.competitions?.[0]?.details || [])];
+      const commentaryItems = Array.isArray(data.commentary) ? data.commentary : (data.commentary?.items || []);
+      const incoming = [
+        ...coreItems.map((item, index) => normaliseEvent(item, index, source)),
+        ...summaryItems.map((item, index) => normaliseEvent(item, index, "summary-live")),
+        ...commentaryItems.map((item, index) => normaliseCommentary(item, index))
+      ]
         .map(enrichEvent)
         .filter(event => event.offset != null && event.type !== "other")
         .filter((event, index, events) => events.findIndex(candidate => `${candidate.type}|${candidate.offset}|${candidate.text}` === `${event.type}|${event.offset}|${event.text}`) === index);
@@ -1074,6 +1082,10 @@ export class MatchRoom {
       this.room.provider.errorCount = 0;
       this.room.provider.playsSource = source;
       this.room.provider.playsProcessed = incoming.length;
+      this.room.provider.rawCorePlays = coreItems.length;
+      this.room.provider.rawSummaryPlays = summaryItems.length;
+      this.room.provider.rawCommentary = commentaryItems.length;
+      this.room.provider.timelineEvents = this.room.timeline.length;
       this.room.provider.summaryAvailable = summary.status === "fulfilled";
       this.room.provider.coreAvailable = core.status === "fulfilled";
       this.room.provider.summaryError = summary.status === "rejected" ? (summary.reason?.message || "Summary unavailable") : null;
