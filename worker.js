@@ -373,29 +373,13 @@ async function scoreboardEvents(sport, league, start, end, region = "gb") {
   const isNrl = sport === "rugby-league" && String(league) === "3";
   if (isNrl) return coreNrlEvents(sport, league, start, end, market);
 
-  // The public discovery page displays today's fixtures, not a 28-day
-  // programme. ESPN's site scoreboard is reliable for individual YYYYMMDD
-  // dates but not consistently for long ranges across competitions.
-  // Query the actual matchday, keeping an in-progress match from the
-  // preceding UTC date when London has already rolled into a new day.
+  // Only today's fixtures are published. Long ESPN date ranges have
+  // inconsistent support and create avoidable discovery failures.
+  // One request per league also keeps the Worker subrequest budget bounded.
   const today = dateKey(Date.now()).replaceAll("-", "");
-  const yesterday = dateKey(Date.now() - 86400000).replaceAll("-", "");
-  const dateRequests = [today, yesterday];
-  const results = await Promise.allSettled(dateRequests.map(date =>
-    readJson(`${siteBase(sport)}/${leaguePath(league)}/scoreboard?dates=${date}&region=${market}&lang=en`)
-  ));
-  if (results.every(result => result.status === "rejected")) {
-    const detail = results.map(result => result.reason?.message || "ESPN request failed").join("; ");
-    throw new Error(`ESPN scoreboard unavailable for ${sport}:${league}: ${detail}`);
-  }
-  const events = new Map();
-  for (const result of results) {
-    if (result.status !== "fulfilled") continue;
-    for (const event of result.value.events || []) {
-      if (event?.id != null) events.set(String(event.id), event);
-    }
-  }
-  return [...events.values()];
+  const data = await readJson(`${siteBase(sport)}/${leaguePath(league)}/scoreboard?dates=${today}&region=${market}&lang=en`);
+  return Array.isArray(data.events) ? data.events : [];
+
 }
 async function readCoreReference(reference) {
   if (!reference) return null;
