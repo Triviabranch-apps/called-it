@@ -818,7 +818,7 @@ export class MatchRoom {
     if (!this.room?.fixture?.id || !this.env?.FIXTURE_INDEX || (!force && Date.now() - (this.adminSyncAt || 0) < 10000)) return;
     this.adminSyncAt = Date.now();
     const rounds = [...(this.room.session?.rounds || []), this.room.session?.round].filter(Boolean).map(round => ({ id: round.id, type: round.targetType, question: round.question, status: round.status, result: round.result || null, openedAt: round.openedAt || null, presentedMatchTime: round.presentedMatchTime || null, voteEndsAt: round.voteEndsAt || null }));
-    const summary = { roomId: this.state.id.toString(), updatedAt: this.adminSyncAt, fixture: this.room.fixture, session: { status: this.room.session?.status, clock: this.room.session?.clock || 0, clockDisplay: this.room.session?.clockDisplay || null, nextQuestionAt: this.room.session?.nextQuestionAt || null }, playerCount: this.room.players?.length || 0, players: (this.room.players || []).map(player => ({ name: player.name, points: player.points || 0, calls: player.calls || player.rounds || 0, correct: player.correct || 0 })), calls: rounds, provider: { lastLivePollAt: this.room.lastLivePollAt || 0, lastErrorAt: this.room.provider?.lastErrorAt || 0, error: this.room.provider?.error || null, errorCount: this.room.provider?.errorCount || 0, pollIntervalSeconds: this.room.provider?.pollIntervalSeconds || 15, playsProcessed: this.room.provider?.playsProcessed || 0, playsSource: this.room.provider?.playsSource || null } };
+    const summary = { roomId: this.state.id.toString(), updatedAt: this.adminSyncAt, fixture: this.room.fixture, session: { status: this.room.session?.status, clock: this.room.session?.clock || 0, clockDisplay: this.room.session?.clockDisplay || null, nextQuestionAt: this.room.session?.nextQuestionAt || null }, playerCount: this.room.players?.length || 0, players: (this.room.players || []).map(player => ({ name: player.name, points: player.points || 0, calls: player.calls || player.rounds || 0, correct: player.correct || 0 })), calls: rounds, provider: { lastLivePollAt: this.room.lastLivePollAt || 0, lastErrorAt: this.room.provider?.lastErrorAt || 0, error: this.room.provider?.error || null, errorCount: this.room.provider?.errorCount || 0, pollIntervalSeconds: this.room.provider?.pollIntervalSeconds || 15, playsProcessed: this.room.provider?.playsProcessed || 0, playsSource: this.room.provider?.playsSource || null, summaryAvailable: this.room.provider?.summaryAvailable ?? null, coreAvailable: this.room.provider?.coreAvailable ?? null, summaryError: this.room.provider?.summaryError || null, coreError: this.room.provider?.coreError || null } };
     try { const id = this.env.FIXTURE_INDEX.idFromName("supported-fixtures"); await this.env.FIXTURE_INDEX.get(id).fetch("https://fixture-index/register-room", { method: "POST", body: JSON.stringify(summary), headers: { "content-type": "application/json" } }); } catch {}
   }
   async archiveCompletedFixture() {
@@ -937,12 +937,25 @@ export class MatchRoom {
         readJson(`${siteBase(sport)}/${leaguePath(league)}/summary?event=${encodeURIComponent(id)}`),
         paginateCore ? readCorePlays(coreUrl) : readCorePlayPage(coreUrl)
       ]);
-      if (summary.status !== "fulfilled") throw summary.reason;
-      const data = summary.value;
-      this.room.matchStats = normaliseMatchStats(data) || this.room.matchStats || null;
+      // Summary and Core plays are independent ESPN feeds. A failed
+      // summary request must not prevent successfully fetched Core events
+      // from reaching the room and settling player calls.
+      if (summary.status !== "fulfilled" && core.status !== "fulfilled") {
+        throw new Error(`ESPN match feeds unavailable: summary: ${summary.reason?.message || "failed"}; plays: ${core.reason?.message || "failed"}`);
+      }
+      const data = summary.status === "fulfilled" ? summary.value : {};
+      if (summary.status === "fulfilled") {
+        this.room.matchStats = normaliseMatchStats(data) || this.room.matchStats || null;
+      }
       const competition = data.header?.competitions?.[0] || data.competitions?.[0] || {};
-      const nextFixture = fixture({ id, name: competition.shortName || competition.name, date: competition.date || this.room.fixture.date, competitions: [{ ...competition, competitors: competition.competitors || [] }], status: competition.status });
-      this.room.fixture = { ...this.room.fixture, ...nextFixture, home: { ...this.room.fixture.home, ...nextFixture.home }, away: { ...this.room.fixture.away, ...nextFixture.away } };
+      // Do not overwrite real team names, status or scores with placeholder
+      // values when only the play-by-play endpoint is responding.
+      const nextFixture = summary.status === "fulfilled"
+        ? fixture({ id, name: competition.shortName || competition.name, date: competition.date || this.room.fixture.date, competitions: [{ ...competition, competitors: competition.competitors || [] }], status: competition.status })
+        : this.room.fixture;
+      if (summary.status === "fulfilled") {
+        this.room.fixture = { ...this.room.fixture, ...nextFixture, home: { ...this.room.fixture.home, ...nextFixture.home }, away: { ...this.room.fixture.away, ...nextFixture.away } };
+      }
       const rosterSource = data.rosters || data.lineups || data.boxscore?.rosters || [];
       const rosterRows = Array.isArray(rosterSource) ? rosterSource : Object.values(rosterSource || {});
       const lineups = rosterRows.flatMap(row => {
@@ -1061,6 +1074,10 @@ export class MatchRoom {
       this.room.provider.errorCount = 0;
       this.room.provider.playsSource = source;
       this.room.provider.playsProcessed = incoming.length;
+      this.room.provider.summaryAvailable = summary.status === "fulfilled";
+      this.room.provider.coreAvailable = core.status === "fulfilled";
+      this.room.provider.summaryError = summary.status === "rejected" ? (summary.reason?.message || "Summary unavailable") : null;
+      this.room.provider.coreError = core.status === "rejected" ? (core.reason?.message || "Core plays unavailable") : null;
       this.room.provider.pollIntervalSeconds = 15;
       this.room.provider.corePaginationIntervalSeconds = 60;
       if (paginateCore) this.room.lastCorePaginationAt = now;
