@@ -211,7 +211,7 @@ function fixture(item) {
 }
 function eventClock(item) {
   const value = Number(item?.clock?.value);
-  const display = item?.clock?.displayValue || item?.displayValue || item?.time?.displayValue || "";
+  const display = item?.clock?.displayValue || item?.displayValue || item?.time?.displayValue || (typeof item?.clock === "string" ? item.clock : "") || (typeof item?.time === "string" ? item.time : "") || "";
   let seconds = Number.isFinite(value) ? value : null;
   if (seconds == null) {
     const match = String(display).match(/(\d+)\s*:\s*(\d{1,2})/);
@@ -1006,7 +1006,7 @@ export class MatchRoom {
       // commentary collection rather than the summary's plays collection.
       // Omitting it leaves the feed stuck at KICKOFF while the clock moves.
       const summaryItems = [...(data.plays || []), ...(data.scoringPlays || []), ...(data.keyEvents || []), ...(data.header?.competitions?.[0]?.details || [])];
-      const commentaryItems = Array.isArray(data.commentary) ? data.commentary : (data.commentary?.items || []);
+      const commentaryItems = Array.isArray(data.commentary) ? data.commentary : (data.commentary?.items || data.commentary?.plays || []);
       const incoming = [
         ...coreItems.map((item, index) => normaliseEvent(item, index, source)),
         ...summaryItems.map((item, index) => normaliseEvent(item, index, "summary-live")),
