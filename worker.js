@@ -218,14 +218,24 @@ function eventClock(item) {
     if (match) seconds = Number(match[1]) * 60 + Number(match[2]);
   }
   if (seconds == null) {
+    // ESPN commentary often provides a clock of "12'" or "45+2'"
+    // without a numeric value. Do not silently discard these events.
+    const minuteClock = String(display).match(/^(\d{1,3})(?:\s*\+\s*(\d{1,2}))?\s*['’]?\s*$/);
+    if (minuteClock) seconds = (Number(minuteClock[1]) + Number(minuteClock[2] || 0)) * 60;
+  }
+  if (seconds == null) {
     const minute = Number(item?.minute ?? item?.time?.minute);
     seconds = Number.isFinite(minute) ? minute * 60 : null;
+  }
+  if (seconds == null) {
+    const textClock = String(item?.text || item?.shortText || "").match(/(?:^|\bat\s+)(\d{1,3})(?:\s*\+\s*(\d{1,2}))?\s*['’]/i);
+    if (textClock) seconds = (Number(textClock[1]) + Number(textClock[2] || 0)) * 60;
   }
   const period = Number(item?.period?.number || item?.period?.id || 1);
   return seconds != null && period > 1 && seconds < 2700 ? seconds + (period - 1) * 2700 : seconds;
 }
 function eventType(item) {
-  const kind = String(item?.type?.type || item?.type?.name || "").toLowerCase();
+  const kind = String(item?.type?.type || item?.type?.name || item?.type?.displayName || item?.type?.text || item?.playType?.text || "").toLowerCase();
   const reversalText = [item?.type?.text, item?.type?.name, item?.text, item?.shortText, item?.description, item?.detail].filter(Boolean).join(" ").toLowerCase();
   if (/no goal|goal (?:disallowed|overturned|cancelled)|(?:disallowed|overturned|cancelled).*goal|var.*(?:no goal|disallowed|overturned|cancelled)/.test(reversalText)) return "var";
   // NRL uses rugby scoring terminology rather than football's goal events.
