@@ -372,19 +372,31 @@ async function scoreboardEvents(sport, league, start, end, region = "gb") {
   const market = regionInfo(region).espn;
   const isNrl = sport === "rugby-league" && String(league) === "3";
   if (isNrl) return coreNrlEvents(sport, league, start, end, market);
-  try {
-    const ranged = await readJson(`${siteBase(sport)}/${leaguePath(league)}/scoreboard?dates=${start}-${end}&region=${market}&lang=en`);
-    if (Array.isArray(ranged.events) && ranged.events.length) return ranged.events;
-    throw new Error(ranged.message || "ESPN returned no ranged events");
-  } catch {
-    // UEFA scoreboard endpoints reject multi-day ranges even though their
-    // single-day endpoints return the fixtures correctly.
-    const dates = [...new Set([start, end, new Date().toISOString().slice(0, 10).replaceAll("-", "")])];
-    const results = await Promise.all(dates.map(date => readJson(`${siteBase(sport)}/${leaguePath(league)}/scoreboard?dates=${date}&region=${market}&lang=en`)));
-    return results.flatMap(result => result.events || []);
-  }
-}
 
+  // The public discovery page displays today's fixtures, not a 28-day
+  // programme. ESPN's site scoreboard is reliable for individual YYYYMMDD
+  // dates but not consistently for long ranges across competitions.
+  // Query the actual matchday, keeping an in-progress match from the
+  // preceding UTC date when London has already rolled into a new day.
+  const today = dateKey(Date.now()).replaceAll("-", "");
+  const yesterday = dateKey(Date.now() - 86400000).replaceAll("-", "");
+  const dateRequests = [today, yesterday];
+  const results = await Promise.allSettled(dateRequests.map(date =>
+    readJson(`${siteBase(sport)}/${leaguePath(league)}/scoreboard?dates=${date}&region=${market}&lang=en`)
+  ));
+  if (results.every(result => result.status === "rejected")) {
+    const detail = results.map(result => result.reason?.message || "ESPN request failed").join("; ");
+    throw new Error(`ESPN scoreboard unavailable for ${sport}:${league}: ${detail}`);
+  }
+  const events = new Map();
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    for (const event of result.value.events || []) {
+      if (event?.id != null) events.set(String(event.id), event);
+    }
+  }
+  return [...events.values()];
+}
 async function readCoreReference(reference) {
   if (!reference) return null;
   return readJson(String(reference).replace(/^http:/, "https:"));
@@ -431,11 +443,13 @@ async function pullFixtures(broadcastRules = DEFAULT_BROADCAST_RULES, enabledCom
   const enabled = new Set(normaliseEnabledCompetitions(enabledCompetitions));
   const start = new Date(now - 21 * 86400000).toISOString().slice(0, 10).replaceAll("-", "");
   const end = new Date(now + 7 * 86400000).toISOString().slice(0, 10).replaceAll("-", "");
-  const programmes = await Promise.allSettled(SUPPORTED_COMPETITIONS.filter(config => enabled.has(`${config.sport}:${config.league}`)).map(async config => ({
-    sport: config.sport,
-    league: config.league,
-    events: await scoreboardEvents(config.sport, config.league, start, end, selectedRegion)
-  })));
+  const programmes = await Promise.allSettled(SUPPORTED_COMPETITIONS.filter(config => enabled.has(`${config.sport}:${config.league}`)).map(async config => {
+    try {
+      return { sport: config.sport, league: config.league, events: await scoreboardEvents(config.sport, config.league, start, end, selectedRegion) };
+    } catch (error) {
+      return { sport: config.sport, league: config.league, events: [], fetchError: error?.message || "ESPN fetch failed" };
+    }
+  }));
   // Fixture discovery and event-coverage validation must not share the same
   // hot path. Validation fans out into Core API requests for several sample
   // matches per competition and can exhaust the Worker subrequest budget,
@@ -443,9 +457,16 @@ async function pullFixtures(broadcastRules = DEFAULT_BROADCAST_RULES, enabledCom
   // to disappear from the catalogue. Keep discovery authoritative and cheap;
   // coverage health is still reported for already-fetched programme rows.
   const coverageResults = programmes.map(result => result.status === "fulfilled"
-    ? { sport: result.value.sport, league: result.value.league, approved: null, checkedAt: now, sampleSize: result.value.events.length, matchesWithData: null, averageEvents: null, coverage: null, reason: "Coverage validation deferred from fixture discovery" }
+    ? { sport: result.value.sport, league: result.value.league, approved: result.value.fetchError ? false : null, checkedAt: now, sampleSize: result.value.events.length, matchesWithData: null, averageEvents: null, coverage: null, reason: result.value.fetchError || "Coverage validation deferred from fixture discovery" }
     : ({ sport: "unknown", league: "unknown", approved: false, checkedAt: now, sampleSize: 0, matchesWithData: 0, averageEvents: 0, coverage: {}, reason: result.reason?.message || "programme pull failed" }));
   const coverage = Object.fromEntries(coverageResults.map(result => [`${result.sport}:${result.league}`, result]));
+  const failedProgrammes = programmes.filter(result => result.status === "rejected" || result.value.fetchError);
+  if (programmes.length && failedProgrammes.length === programmes.length) {
+    throw new Error("ESPN fixture discovery failed for every enabled competition: " +
+      failedProgrammes.map(result => result.status === "fulfilled"
+        ? `${result.value.sport}:${result.value.league} (${result.value.fetchError})`
+        : (result.reason?.message || "unknown error")).join("; ").slice(0, 900));
+  }
   // Keep the complete fetched programme available to the discovery
   // surface. The public endpoint selects today's fixtures.
   const published = programmes.flatMap(result => result.status === "fulfilled"
