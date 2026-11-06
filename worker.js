@@ -157,9 +157,28 @@ function json(data, status = 200) {
 }
 function leaguePath(league) { return encodeURIComponent((league || "eng.1").trim().toLowerCase()); }
 async function readJson(url) {
-  const response = await fetch(url, { cache: "no-store", headers: { accept: "application/json, text/plain, */*", "cache-control": "no-cache", pragma: "no-cache", "accept-language": "en-GB,en;q=0.9", "origin": "https://www.espn.com", "referer": "https://www.espn.com/", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "x-requested-with": "XMLHttpRequest", "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "cross-site", 'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"', "sec-ch-ua-mobile": "?0", 'sec-ch-ua-platform': '"Windows"' } });
-  if (!response.ok) throw new Error(`ESPN returned ${response.status}`);
-  return response.json();
+  // ESPN may reject browser-spoofed server requests with 403. Cloudflare
+  // Workers should use native fetch headers, not synthetic Chrome headers.
+  const candidates = [url];
+  if (url.startsWith(ESPN_SITE_ROOT + "/")) {
+    candidates.push(url.replace(ESPN_SITE_ROOT, "https://site.api.espn.com/apis/site/v2/sports"));
+  }
+  const failures = [];
+  for (const target of candidates) {
+    try {
+      const response = await fetch(target, { cache: "no-store", headers: { accept: "application/json" } });
+      if (!response.ok) {
+        failures.push(`${new URL(target).host} HTTP ${response.status}`);
+        continue;
+      }
+      const data = await response.json();
+      if (data?.code >= 400 || data?.error) throw new Error(data.message || data.error);
+      return data;
+    } catch (error) {
+      failures.push(`${new URL(target).host}: ${error?.message || String(error)}`);
+    }
+  }
+  throw new Error(`ESPN unavailable: ${failures.join("; ")}`);
 }
 async function readCorePlays(baseUrl) {
   const first = await readJson(`${baseUrl}/plays?limit=300&page=1&lang=en&region=us`);
