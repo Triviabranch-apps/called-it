@@ -285,6 +285,38 @@ function normaliseEvent(item, index, source) {
   const team = item?.team?.displayName || item?.team?.shortDisplayName || item?.team?.name || item?.competitor?.team?.displayName || item?.competitor?.displayName || textTeam;
   return { id: String(item?.id || (source + "-" + index)), source, type: eventType(item), offset, minute, period: item?.period?.number || item?.period?.displayValue || null, text, athletes, team, valid: item?.valid !== false, scoringPlay: Boolean(item?.scoringPlay), raw: item };
 }
+// ESPN repeats the same scoring play across Core, summary and commentary,
+// often under different IDs and with slightly different text/clock values.
+function goalIdentity(event) {
+  if (event?.type !== "goal") return null;
+  const minute = Number(event.minute ?? (Number.isFinite(Number(event.offset)) ? Math.floor(Number(event.offset) / 60) : NaN));
+  const team = normaliseTeamName(event.team);
+  if (!Number.isFinite(minute) || !team) return null;
+  // Same team and minute is the stable identity across ESPN's differently
+  // formatted play records; distinct goals one minute apart remain distinct.
+  return `goal|${team}|${minute}`;
+}
+function mergeDuplicateGoals(timeline) {
+  const seen = new Map(), unique = [], aliases = new Map();
+  for (const event of timeline) {
+    const key = goalIdentity(event);
+    const existing = key && seen.get(key);
+    if (!existing) {
+      unique.push(event);
+      if (key) seen.set(key, event);
+      continue;
+    }
+    aliases.set(String(event.id), String(existing.id));
+    if (!existing.athletes?.length && event.athletes?.length) existing.athletes = event.athletes;
+    if (!existing.team && event.team) existing.team = event.team;
+    if ((!existing.text || existing.text === "Match update") && event.text) existing.text = event.text;
+    if (event.valid === false || event.invalidated) {
+      existing.valid = false;
+      existing.invalidated = true;
+    }
+  }
+  return { unique, aliases };
+}
 function normaliseCorePlay(item, index) { return normaliseEvent({ ...item, text: item.text || item.shortText || item.alternativeText || item.type?.text }, index, "core-play"); }
 function normaliseCommentary(item, index) { const play = item?.play || item; return normaliseEvent({ ...play, clock: play.clock || item.time, text: item.text || play.text || play.shortText }, index, "commentary"); }
 function meaningful(item) { return eventType(item) !== "other"; }
@@ -1015,11 +1047,29 @@ export class MatchRoom {
         .map(enrichEvent)
         .filter(event => event.offset != null && event.type !== "other")
         .filter((event, index, events) => events.findIndex(candidate => `${candidate.type}|${candidate.offset}|${candidate.text}` === `${event.type}|${event.offset}|${event.text}`) === index);
+      // Repair duplicates persisted by previous Worker versions before
+      // merging this poll's events into the active room.
+      const prior = mergeDuplicateGoals(this.room.timeline);
+      this.room.timeline = prior.unique;
+      if (prior.aliases.size) {
+        for (const question of [
+          ...(this.room.preMatch || []),
+          ...Object.values(this.room.playerPreMatch || {}).flat(),
+          ...(this.room.session?.rounds || []),
+          this.room.session?.round
+        ].filter(Boolean)) {
+          if (question.result?.eventId && prior.aliases.has(String(question.result.eventId))) {
+            question.result.eventId = prior.aliases.get(String(question.result.eventId));
+          }
+        }
+      }
+      const goalByIdentity = new Map(this.room.timeline.map(event => [goalIdentity(event), event]).filter(([key]) => key));
       const byId = new Map(this.room.timeline.map(event => [String(event.id), event]));
       const byShape = new Map(this.room.timeline.map(event => [`${event.type}|${event.offset}|${event.text}`, event]));
       for (const event of incoming) {
         const key = `${event.type}|${event.offset}|${event.text}`;
-        const existing = byId.get(String(event.id)) || byShape.get(key);
+        const identity = goalIdentity(event);
+        const existing = byId.get(String(event.id)) || byShape.get(key) || (identity && goalByIdentity.get(identity));
         if (existing) {
           // ESPN may enrich the same play on a later poll with its team or
           // athlete. Update the canonical event instead of dropping it.
@@ -1036,12 +1086,14 @@ export class MatchRoom {
           });
           byId.set(String(event.id), existing);
           byShape.set(key, existing);
+          if (identity) goalByIdentity.set(identity, existing);
           continue;
         }
         const canonical = { id: event.id, type: event.type, offset: event.offset, minute: event.minute, text: event.text, team: event.team || null, committingTeam: foulCommittingTeam(event, this.room.fixture), athletes: event.athletes || [], valid: event.valid !== false, scoringPlay: event.scoringPlay || false };
         this.room.timeline.push(canonical);
         byId.set(String(event.id), canonical);
         byShape.set(key, canonical);
+        if (identity) goalByIdentity.set(identity, canonical);
         this.room.events.unshift({ label: event.type === "goal" ? "GOAL" : "Match update", detail: event.text });
       }
       const reversalEvents = incoming.filter(event => event.type === "var" && /no goal|goal (?:disallowed|overturned|cancelled)|(?:disallowed|overturned|cancelled).*goal|var.*(?:no goal|disallowed|overturned|cancelled)/i.test(String(event.text || "")));
@@ -1077,15 +1129,10 @@ export class MatchRoom {
         this.room.events.unshift({ label: "VAR overturn", detail: "A provisional goal was removed" });
       }
       this.room.timeline.sort((a, b) => a.offset - b.offset);
-      const homeName = String(this.room.fixture.home?.name || "").toLowerCase();
-      const awayName = String(this.room.fixture.away?.name || "").toLowerCase();
-      const goals = this.room.timeline.filter(event => event.type === "goal" && event.valid !== false && !event.invalidated);
-      const homeGoals = goals.filter(event => String(event.team || "").toLowerCase() === homeName).length;
-      const awayGoals = goals.filter(event => String(event.team || "").toLowerCase() === awayName).length;
-      if (homeGoals || awayGoals || this.room.timeline.some(event => event.type === "goal")) {
-        this.room.fixture.home.score = homeGoals;
-        this.room.fixture.away.score = awayGoals;
-      }
+      // The ESPN competition scoreboard is authoritative. Never replace its
+      // home/away scores with counts of play events: feeds overlap, goals can
+      // be disallowed, and play-by-play coverage can be incomplete.
+      // If summary is unavailable, retain the most recent provider score.
       this.room.lastProviderEventIds = this.room.timeline.map(e => e.id);
       this.room.lastLivePollAt = Date.now();
       this.room.provider.error = null;
